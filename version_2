@@ -1,0 +1,1265 @@
+
+#!/usr/bin/env python3
+
+"""
+SEO MARKET INTELLIGENCE CRAWLER V2
+
+Purpose:
+Analyze publicly accessible competitor websites
+for digital marketing and SEO research.
+
+Database: SQLite
+Output: CSV
+Analytics: Power BI
+"""
+
+import requests
+import sqlite3
+import csv
+import re
+import time
+import argparse
+
+from bs4 import BeautifulSoup
+from collections import Counter, deque
+from urllib.parse import urljoin, urlparse, urldefrag
+from urllib.robotparser import RobotFileParser
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+# =====================================================
+# 1. CONFIGURATION
+# =====================================================
+
+USER_AGENT = "SEO-Market-Research-Bot/2.0"
+
+STOPWORDS = set("""
+a an and are as at be by for from has have he in is it its
+of on or that the this to was were will with you your
+com www home services service about digital marketing seo
+""".split())
+
+
+# =====================================================
+# 2. DATABASE SETUP
+# =====================================================
+
+class Database:
+
+    def __init__(self, db_name="market_intel.db"):
+
+        self.conn = sqlite3.connect(db_name)
+
+        self.conn.execute("PRAGMA foreign_keys = ON")
+
+        self.conn.executescript("""
+
+        CREATE TABLE IF NOT EXISTS competitors (
+
+            competitor_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            domain TEXT UNIQUE,
+            seed_url TEXT,
+            created_at TEXT
+
+        );
+
+        CREATE TABLE IF NOT EXISTS crawl_runs (
+
+            run_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            competitor_id INTEGER,
+            started_at TEXT,
+            finished_at TEXT,
+            pages_crawled INTEGER DEFAULT 0,
+            pages_failed INTEGER DEFAULT 0,
+            status TEXT,
+
+            FOREIGN KEY (competitor_id)
+            REFERENCES competitors(competitor_id)
+
+        );
+
+        CREATE TABLE IF NOT EXISTS pages (
+
+            page_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            competitor_id INTEGER,
+
+            url TEXT,
+            final_url TEXT,
+            status_code INTEGER,
+
+            title TEXT,
+            title_length INTEGER,
+
+            meta_description TEXT,
+            meta_description_length INTEGER,
+
+            canonical_url TEXT,
+            meta_robots TEXT,
+            is_indexable INTEGER,
+
+            h1_text TEXT,
+            h1_count INTEGER,
+
+            h2_text TEXT,
+            h2_count INTEGER,
+
+            word_count INTEGER,
+
+            internal_links INTEGER,
+            external_links INTEGER,
+
+            image_count INTEGER,
+            images_missing_alt INTEGER,
+
+            jsonld_count INTEGER,
+
+            og_title TEXT,
+            og_description TEXT,
+
+            twitter_card TEXT,
+
+            url_depth INTEGER,
+
+            crawled_at TEXT,
+
+            UNIQUE(run_id, url),
+
+            FOREIGN KEY (run_id)
+            REFERENCES crawl_runs(run_id),
+
+            FOREIGN KEY (competitor_id)
+            REFERENCES competitors(competitor_id)
+
+        );
+
+        CREATE TABLE IF NOT EXISTS keywords (
+
+            keyword_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            competitor_id INTEGER,
+            page_url TEXT,
+            keyword TEXT,
+            occurrences INTEGER
+
+        );
+
+        CREATE TABLE IF NOT EXISTS links (
+
+            link_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id INTEGER,
+            source_url TEXT,
+            destination_url TEXT,
+            link_type TEXT,
+            anchor_text TEXT
+
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_pages_run
+        ON pages(run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_keywords_run
+        ON keywords(run_id);
+
+        CREATE INDEX IF NOT EXISTS idx_links_run
+        ON links(run_id);
+
+        """)
+
+        self.conn.commit()
+
+    def close(self):
+        self.conn.close()
+
+
+# =====================================================
+# 3. URL UTILITIES
+# =====================================================
+
+def normalize_url(url):
+
+    url = urldefrag(url.strip())[0]
+
+    parsed = urlparse(url)
+
+    if parsed.scheme not in ("http", "https"):
+        return ""
+
+    if not parsed.netloc:
+        return ""
+
+    return url.rstrip("/") if parsed.path not in ("", "/") else url
+
+
+def get_domain(url):
+
+    return (
+        urlparse(url).hostname or ""
+    ).lower().removeprefix("www.")
+
+
+def is_same_domain(url, domain):
+
+    host = get_domain(url)
+
+    return (
+        host == domain or
+        host.endswith("." + domain)
+    )
+
+
+# =====================================================
+# 4. SEO CRAWLER
+# =====================================================
+
+class SEOCrawler:
+
+    def __init__(
+        self,
+        database,
+        delay=2,
+        timeout=20,
+        max_bytes=2000000
+    ):
+
+        self.db = database
+        self.delay = delay
+        self.timeout = timeout
+        self.max_bytes = max_bytes
+
+        self.session = requests.Session()
+
+        self.session.headers.update({
+            "User-Agent": USER_AGENT
+        })
+
+        self.robots_cache = {}
+
+        self.last_request = {}
+
+    # -------------------------------------------------
+    # REQUEST PACING
+    # -------------------------------------------------
+
+    def wait(self, domain):
+
+        previous = self.last_request.get(domain, 0)
+
+        remaining = self.delay - (
+            time.monotonic() - previous
+        )
+
+        if remaining > 0:
+            time.sleep(remaining)
+
+        self.last_request[domain] = time.monotonic()
+
+    # -------------------------------------------------
+    # ROBOTS.TXT
+    # -------------------------------------------------
+
+    def get_robots(self, url, domain):
+
+        origin = (
+            f"{urlparse(url).scheme}://"
+            f"{urlparse(url).netloc}"
+        )
+
+        if origin not in self.robots_cache:
+
+            parser = RobotFileParser()
+
+            robots_url = urljoin(
+                origin,
+                "/robots.txt"
+            )
+
+            try:
+
+                self.wait(domain)
+
+                response = self.session.get(
+                    robots_url,
+                    timeout=self.timeout
+                )
+
+                if response.status_code == 200:
+
+                    parser.parse(
+                        response.text.splitlines()
+                    )
+
+                elif response.status_code in (401, 403):
+
+                    parser.parse([
+                        "User-agent: *",
+                        "Disallow: /"
+                    ])
+
+                else:
+
+                    parser.parse([])
+
+            except requests.RequestException:
+
+                # Fail closed if robots.txt cannot be checked.
+                parser.parse([
+                    "User-agent: *",
+                    "Disallow: /"
+                ])
+
+            self.robots_cache[origin] = parser
+
+        return self.robots_cache[origin]
+
+    def allowed(self, url, domain):
+
+        return self.get_robots(
+            url,
+            domain
+        ).can_fetch(USER_AGENT, url)
+
+    # -------------------------------------------------
+    # SITEMAP DISCOVERY
+    # -------------------------------------------------
+
+    def discover_sitemap(self, seed, domain):
+
+        parser = self.get_robots(seed, domain)
+
+        sitemap_urls = parser.site_maps() or [
+            urljoin(seed, "/sitemap.xml")
+        ]
+
+        discovered = []
+
+        for sitemap in sitemap_urls[:10]:
+
+            if not is_same_domain(sitemap, domain):
+                continue
+
+            if not self.allowed(sitemap, domain):
+                continue
+
+            try:
+
+                self.wait(domain)
+
+                response = self.session.get(
+                    sitemap,
+                    timeout=self.timeout
+                )
+
+                if response.status_code != 200:
+                    continue
+
+                from xml.etree import ElementTree
+
+                root = ElementTree.fromstring(
+                    response.content[:self.max_bytes]
+                )
+
+                # Handles ordinary urlset sitemaps.
+                # Sitemap indexes can be extended recursively.
+                for element in root.iter():
+
+                    if element.tag.endswith("loc"):
+
+                        link = normalize_url(
+                            element.text or ""
+                        )
+
+                        if link and is_same_domain(
+                            link,
+                            domain
+                        ):
+
+                            discovered.append(link)
+
+            except Exception as error:
+
+                print("Sitemap error:", error)
+
+        return discovered
+
+    # -------------------------------------------------
+    # KEYWORD EXTRACTION
+    # -------------------------------------------------
+
+    def extract_keywords(self, text):
+
+        words = re.findall(
+            r"[a-z][a-z0-9'-]{2,}",
+            text.lower()
+        )
+
+        words = [
+            word for word in words
+            if word not in STOPWORDS
+        ]
+
+        return Counter(words).most_common(30)
+
+    # -------------------------------------------------
+    # PAGE CRAWLING
+    # -------------------------------------------------
+
+    def crawl_page(
+        self,
+        url,
+        domain,
+        competitor_id,
+        run_id
+    ):
+
+        if not self.allowed(url, domain):
+
+            print("[ROBOTS BLOCKED]", url)
+
+            return []
+
+        try:
+
+            self.wait(domain)
+
+            start = time.monotonic()
+
+            response = self.session.get(
+                url,
+                timeout=self.timeout,
+                allow_redirects=True,
+                stream=True
+            )
+
+            elapsed = time.monotonic() - start
+
+            final_url = normalize_url(
+                response.url
+            )
+
+            if not is_same_domain(final_url, domain):
+
+                response.close()
+
+                print("[REDIRECT BLOCKED]", url)
+
+                return []
+
+            content_type = response.headers.get(
+                "Content-Type", ""
+            ).lower()
+
+            if (
+                response.status_code >= 400 or
+                "text/html" not in content_type
+            ):
+
+                response.close()
+
+                print("[SKIPPED]", url)
+
+                return []
+
+            raw = response.raw.read(
+                self.max_bytes,
+                decode_content=True
+            )
+
+            response.close()
+
+            html = raw.decode(
+                response.encoding or "utf-8",
+                errors="replace"
+            )
+
+            soup = BeautifulSoup(
+                html,
+                "html.parser"
+            )
+
+            # Preserve JSON-LD count before removing scripts.
+            jsonld_count = len(
+                soup.find_all(
+                    "script",
+                    attrs={"type": re.compile(
+                        r"application/ld\+json",
+                        re.I
+                    )}
+                )
+            )
+
+            for element in soup([
+                "script",
+                "style",
+                "noscript",
+                "svg",
+                "iframe",
+                "template"
+            ]):
+
+                element.decompose()
+
+            # -----------------------------------------
+            # ON-PAGE SEO
+            # -----------------------------------------
+
+            title = (
+                soup.title.get_text(
+                    " ",
+                    strip=True
+                )
+                if soup.title else ""
+            )
+
+            description_tag = soup.find(
+                "meta",
+                attrs={
+                    "name": re.compile(
+                        "^description$",
+                        re.I
+                    )
+                }
+            )
+
+            description = (
+                description_tag.get("content", "").strip()
+                if description_tag else ""
+            )
+
+            canonical_tag = soup.find(
+                "link",
+                rel=lambda value:
+                value and "canonical" in value
+            )
+
+            canonical = (
+                urljoin(
+                    final_url,
+                    canonical_tag.get("href", "")
+                )
+                if canonical_tag else ""
+            )
+
+            robots_tag = soup.find(
+                "meta",
+                attrs={
+                    "name": re.compile(
+                        "^(robots|googlebot)$",
+                        re.I
+                    )
+                }
+            )
+
+            meta_robots = (
+                robots_tag.get("content", "")
+                if robots_tag else ""
+            )
+
+            is_indexable = int(
+                not re.search(
+                    r"\bnoindex\b",
+                    meta_robots,
+                    re.I
+                )
+                and response.status_code == 200
+            )
+
+            h1_tags = soup.find_all("h1")
+
+            h2_tags = soup.find_all("h2")
+
+            h1_text = " | ".join(
+                tag.get_text(" ", strip=True)
+                for tag in h1_tags
+            )
+
+            h2_text = " | ".join(
+                tag.get_text(" ", strip=True)
+                for tag in h2_tags
+            )
+
+            # -----------------------------------------
+            # CONTENT ANALYSIS
+            # -----------------------------------------
+
+            page_text = re.sub(
+                r"\s+",
+                " ",
+                soup.get_text(" ", strip=True)
+            ).strip()
+
+            word_count = len(
+                re.findall(
+                    r"\b[\w'-]+\b",
+                    page_text
+                )
+            )
+
+            keywords = self.extract_keywords(
+                page_text
+            )
+
+            # -----------------------------------------
+            # IMAGE ANALYSIS
+            # -----------------------------------------
+
+            images = soup.find_all("img")
+
+            missing_alt = sum(
+                1 for image in images
+                if not (image.get("alt") or "").strip()
+            )
+
+            # -----------------------------------------
+            # LINK ANALYSIS
+            # -----------------------------------------
+
+            internal_links = 0
+
+            external_links = 0
+
+            discovered_links = []
+
+            link_rows = []
+
+            for link in soup.find_all(
+                "a",
+                href=True
+            ):
+
+                destination = normalize_url(
+                    urljoin(
+                        final_url,
+                        link["href"]
+                    )
+                )
+
+                if not destination:
+                    continue
+
+                anchor = link.get_text(
+                    " ",
+                    strip=True
+                )[:500]
+
+                if is_same_domain(
+                    destination,
+                    domain
+                ):
+
+                    internal_links += 1
+
+                    discovered_links.append(
+                        destination
+                    )
+
+                    link_type = "internal"
+
+                else:
+
+                    external_links += 1
+
+                    link_type = "external"
+
+                link_rows.append((
+                    run_id,
+                    final_url,
+                    destination,
+                    link_type,
+                    anchor
+                ))
+
+            # -----------------------------------------
+            # SOCIAL METADATA
+            # -----------------------------------------
+
+            def get_meta(name, attr="property"):
+
+                tag = soup.find(
+                    "meta",
+                    attrs={
+                        attr: re.compile(
+                            "^" + re.escape(name) + "$",
+                            re.I
+                        )
+                    }
+                )
+
+                return (
+                    tag.get("content", "")
+                    if tag else ""
+                )
+
+            og_title = get_meta("og:title")
+
+            og_description = get_meta(
+                "og:description"
+            )
+
+            twitter_card = get_meta(
+                "twitter:card",
+                "name"
+            )
+
+            url_depth = len([
+                part for part in
+                urlparse(final_url).path.split("/")
+                if part
+            ])
+
+            # -----------------------------------------
+            # SAVE PAGE TO DATABASE
+            # -----------------------------------------
+
+            cursor = self.db.conn.execute("""
+
+            INSERT OR IGNORE INTO pages (
+
+                run_id,
+                competitor_id,
+                url,
+                final_url,
+                status_code,
+
+                title,
+                title_length,
+
+                meta_description,
+                meta_description_length,
+
+                canonical_url,
+                meta_robots,
+                is_indexable,
+
+                h1_text,
+                h1_count,
+
+                h2_text,
+                h2_count,
+
+                word_count,
+
+                internal_links,
+                external_links,
+
+                image_count,
+                images_missing_alt,
+
+                jsonld_count,
+
+                og_title,
+                og_description,
+                twitter_card,
+
+                url_depth,
+                crawled_at
+
+            ) VALUES (
+                ?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?
+            )
+
+            """, (
+
+                run_id,
+                competitor_id,
+                url,
+                final_url,
+                response.status_code,
+
+                title,
+                len(title),
+
+                description,
+                len(description),
+
+                canonical,
+                meta_robots,
+                is_indexable,
+
+                h1_text,
+                len(h1_tags),
+
+                h2_text,
+                len(h2_tags),
+
+                word_count,
+
+                internal_links,
+                external_links,
+
+                len(images),
+                missing_alt,
+
+                jsonld_count,
+
+                og_title,
+                og_description,
+                twitter_card,
+
+                url_depth,
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+
+            ))
+
+            if cursor.rowcount:
+
+                self.db.conn.executemany("""
+
+                INSERT INTO keywords (
+                    run_id,
+                    competitor_id,
+                    page_url,
+                    keyword,
+                    occurrences
+                )
+
+                VALUES (?, ?, ?, ?, ?)
+
+                """, [
+
+                    (
+                        run_id,
+                        competitor_id,
+                        url,
+                        keyword,
+                        count
+                    )
+
+                    for keyword, count in keywords
+
+                ])
+
+                self.db.conn.executemany("""
+
+                INSERT INTO links (
+                    run_id,
+                    source_url,
+                    destination_url,
+                    link_type,
+                    anchor_text
+                )
+
+                VALUES (?, ?, ?, ?, ?)
+
+                """, link_rows)
+
+                self.db.conn.commit()
+
+            print(
+                f"[{response.status_code}] "
+                f"{final_url} | "
+                f"{word_count} words | "
+                f"{len(h1_tags)} H1"
+            )
+
+            return discovered_links
+
+        except requests.RequestException as error:
+
+            print("[ERROR]", url, error)
+
+            return []
+
+    # -------------------------------------------------
+    # COMPETITOR CRAWLING
+    # -------------------------------------------------
+
+    def crawl_competitor(
+        self,
+        name,
+        seed_url,
+        max_pages
+    ):
+
+        seed_url = normalize_url(seed_url)
+
+        domain = get_domain(seed_url)
+
+        if not seed_url or not domain:
+
+            raise ValueError("Invalid competitor URL")
+
+        now = datetime.now(
+            timezone.utc
+        ).isoformat()
+
+        self.db.conn.execute("""
+
+        INSERT INTO competitors (
+            name,
+            domain,
+            seed_url,
+            created_at
+        )
+
+        VALUES (?, ?, ?, ?)
+
+        ON CONFLICT(domain) DO UPDATE SET
+            name=excluded.name,
+            seed_url=excluded.seed_url
+
+        """, (
+            name,
+            domain,
+            seed_url,
+            now
+        ))
+
+        self.db.conn.commit()
+
+        competitor_id = self.db.conn.execute(
+            "SELECT competitor_id FROM competitors WHERE domain=?",
+            (domain,)
+        ).fetchone()[0]
+
+        cursor = self.db.conn.execute("""
+
+        INSERT INTO crawl_runs (
+            competitor_id,
+            started_at,
+            status
+        )
+
+        VALUES (?, ?, 'running')
+
+        """, (
+            competitor_id,
+            now
+        ))
+
+        run_id = cursor.lastrowid
+
+        self.db.conn.commit()
+
+        queue = deque([seed_url])
+
+        queue.extend(
+            self.discover_sitemap(
+                seed_url,
+                domain
+            )
+        )
+
+        visited = set()
+
+        crawled = 0
+
+        failed = 0
+
+        while queue and crawled < max_pages:
+
+            url = normalize_url(
+                queue.popleft()
+            )
+
+            if not url or url in visited:
+                continue
+
+            if not is_same_domain(
+                url,
+                domain
+            ):
+                continue
+
+            visited.add(url)
+
+            links = self.crawl_page(
+                url,
+                domain,
+                competitor_id,
+                run_id
+            )
+
+            if links:
+
+                crawled += 1
+
+                for link in links:
+
+                    if link not in visited:
+
+                        queue.append(link)
+
+            else:
+
+                failed += 1
+
+        self.db.conn.execute("""
+
+        UPDATE crawl_runs
+
+        SET finished_at=?,
+            pages_crawled=?,
+            pages_failed=?,
+            status='completed'
+
+        WHERE run_id=?
+
+        """, (
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+            crawled,
+            failed,
+            run_id
+        ))
+
+        self.db.conn.commit()
+
+        print("\nCOMPETITOR CRAWL COMPLETE")
+
+        print("Competitor:", name)
+
+        print("Pages crawled:", crawled)
+
+        print("Pages failed/skipped:", failed)
+
+        return run_id, competitor_id
+
+    # -------------------------------------------------
+    # CSV EXPORT
+    # -------------------------------------------------
+
+    def export_csv(self, run_id, output_dir):
+
+        output_dir = Path(output_dir)
+
+        output_dir.mkdir(
+            parents=True,
+            exist_ok=True
+        )
+
+        exports = {
+
+            "pages.csv": """
+
+            SELECT
+                p.*,
+                c.name AS competitor_name,
+                c.domain
+
+            FROM pages p
+
+            JOIN competitors c
+            ON p.competitor_id = c.competitor_id
+
+            WHERE p.run_id = ?
+
+            """,
+
+            "keywords.csv": """
+
+            SELECT
+                c.name AS competitor_name,
+                k.page_url,
+                k.keyword,
+                k.occurrences
+
+            FROM keywords k
+
+            JOIN competitors c
+            ON k.competitor_id = c.competitor_id
+
+            WHERE k.run_id = ?
+
+            """,
+
+            "links.csv": """
+
+            SELECT *
+
+            FROM links
+
+            WHERE run_id = ?
+
+            """,
+
+            "competitor_summary.csv": """
+
+            SELECT
+
+                c.name AS competitor_name,
+                c.domain,
+
+                r.run_id,
+                r.pages_crawled,
+                r.pages_failed,
+
+                ROUND(AVG(p.word_count), 1)
+                    AS avg_word_count,
+
+                ROUND(AVG(p.title_length), 1)
+                    AS avg_title_length,
+
+                ROUND(AVG(p.meta_description_length), 1)
+                    AS avg_meta_length,
+
+                SUM(
+                    CASE WHEN p.title_length = 0
+                    THEN 1 ELSE 0 END
+                ) AS missing_titles,
+
+                SUM(
+                    CASE WHEN p.meta_description_length = 0
+                    THEN 1 ELSE 0 END
+                ) AS missing_descriptions,
+
+                SUM(
+                    CASE WHEN p.h1_count = 0
+                    THEN 1 ELSE 0 END
+                ) AS pages_without_h1,
+
+                SUM(
+                    p.images_missing_alt
+                ) AS images_missing_alt
+
+            FROM crawl_runs r
+
+            JOIN competitors c
+            ON r.competitor_id = c.competitor_id
+
+            LEFT JOIN pages p
+            ON r.run_id = p.run_id
+
+            WHERE r.run_id = ?
+
+            GROUP BY
+                c.name,
+                c.domain,
+                r.run_id
+
+            """
+
+        }
+
+        for filename, query in exports.items():
+
+            cursor = self.db.conn.execute(
+                query,
+                (run_id,)
+            )
+
+            headers = [
+                column[0]
+                for column in cursor.description
+            ]
+
+            with open(
+                output_dir / filename,
+                "w",
+                newline="",
+                encoding="utf-8-sig"
+            ) as file:
+
+                writer = csv.writer(file)
+
+                writer.writerow(headers)
+
+                writer.writerows(
+                    cursor.fetchall()
+                )
+
+        print(
+            "\nCSV exports saved to:",
+            output_dir
+        )
+
+
+# =====================================================
+# 5. MAIN PROGRAM
+# =====================================================
+
+def main():
+
+    parser = argparse.ArgumentParser(
+        description="SEO Market Intelligence Crawler V2"
+    )
+
+    parser.add_argument(
+        "--competitor",
+        action="append",
+        required=True,
+        help='Example: "Agency=https://example.com"'
+    )
+
+    parser.add_argument(
+        "--max-pages",
+        type=int,
+        default=100
+    )
+
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=2
+    )
+
+    parser.add_argument(
+        "--db",
+        default="data/market_intel.db"
+    )
+
+    parser.add_argument(
+        "--export-dir",
+        default="exports"
+    )
+
+    args = parser.parse_args()
+
+    if args.max_pages < 1:
+        parser.error("--max-pages must be positive")
+
+    Path(args.db).parent.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+    database = Database(args.db)
+
+    crawler = SEOCrawler(
+        database,
+        delay=args.delay
+    )
+
+    try:
+
+        for competitor in args.competitor:
+
+            if "=" in competitor:
+
+                name, url = competitor.split(
+                    "=",
+                    1
+                )
+
+            else:
+
+                url = competitor
+
+                name = get_domain(url)
+
+            run_id, competitor_id = (
+                crawler.crawl_competitor(
+                    name.strip(),
+                    url.strip(),
+                    args.max_pages
+                )
+            )
+
+            crawler.export_csv(
+                run_id,
+                Path(args.export_dir) / f"run_{run_id}"
+            )
+
+    finally:
+
+        database.close()
+
+
+if __name__ == "__main__":
+
+    main()
